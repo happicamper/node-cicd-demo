@@ -54,6 +54,26 @@ integration, plus a plain-text/table report uploaded as a workflow artifact —
 so results are readable without needing GitHub Advanced Security (a paid
 feature this repo doesn't rely on).
 
+## Proof of Concept(Screenshots)
+### Deployment Overview
+<img width="2071" height="726" alt="deployment_overview2" src="https://github.com/user-attachments/assets/22e04d71-48ca-49b7-b0ca-c941ce937b84" />
+
+### AWS VPC
+<img width="1702" height="969" alt="vpc" src="https://github.com/user-attachments/assets/eed899cf-4607-4564-bb97-12d8e31f50a3" />
+
+### ECS Cluster Service
+<img width="1910" height="1082" alt="ecs-cluster3" src="https://github.com/user-attachments/assets/9cd0ed54-562a-4993-a87b-dcbb00b31283" />
+
+### Application Endpoint
+- /
+<img width="1089" height="233" alt="node-app-version1" src="https://github.com/user-attachments/assets/4cc44e73-8169-4638-9627-ccecf907ed18" />
+
+- /health
+<img width="683" height="220" alt="node-app-health" src="https://github.com/user-attachments/assets/23f6d7f0-67c5-4be4-b8c2-d3629dfda3f6" />
+
+- /version
+<img width="1349" height="278" alt="node-app-version_page" src="https://github.com/user-attachments/assets/240a8494-c4a6-4737-af73-38b2ba25d57b" />
+
 ## Environment promotion
 
 - **Staging** deploys automatically on every push to `main`, runs on Fargate
