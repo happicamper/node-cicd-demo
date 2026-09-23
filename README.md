@@ -131,5 +131,5 @@ setup:
 - **Separate AWS accounts per environment** this project uses a single account setup
 - **GitHub's native required-reviewers** this project uses an issue-based approval
   workaround
-- A **host-based ALB routing / Domain ** this projects seperates the two environment
+- A **host-based ALB routing / Domain** this projects seperates the two environment
   URLS using ports.
