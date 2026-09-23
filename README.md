@@ -103,26 +103,12 @@ feature this repo doesn't rely on).
   `node` user and has `npm`/`npx` removed post-build, eliminating CVEs that
   live in tooling never used at runtime.
 
-## Real issues found and fixed by this pipeline
-
-The DAST full-scan stage against a live staging deployment caught genuine
-findings, not synthetic ones — the kind of thing header-only linting doesn't:
-
-- Missing `X-Content-Type-Options`, leaking `X-Powered-By`, no
-  `Permissions-Policy` — fixed via [Helmet](https://helmetjs.github.io/).
-- A subtler one: Express's built-in `finalhandler` was **silently overwriting**
-  Helmet's Content-Security-Policy header (`default-src 'none'`) on any
-  unmatched route (e.g. `/robots.txt`), dropping the `frame-ancestors`,
-  `base-uri`, and `form-action` directives that don't fall back to
-  `default-src`. Fixed with an explicit catch-all 404 handler, and pinned in
-  place with a regression test so it can't silently come back.
-
 ## Tech stack
 
-**App:** Node.js 24, Express 5, Helmet
-**Infra:** Terraform (`terraform-aws-modules`), AWS ECS Fargate, ALB, ECR
-**CI/CD:** GitHub Actions, OIDC-based AWS auth
-**Security:** Gitleaks, Trivy, Semgrep, OWASP ZAP
+**App:** Node.js 24, Express 5, Helmet  
+**Infra:** Terraform (`terraform-aws-modules`), AWS ECS Fargate, ALB, ECR  
+**CI/CD:** GitHub Actions, OIDC-based AWS auth  
+**Security:** Gitleaks, Trivy, Semgrep, OWASP ZAP  
 **Testing:** Jest, Supertest
 
 ## Running it locally
