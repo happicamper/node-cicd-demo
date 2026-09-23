@@ -1,0 +1,468 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # manual trigger of workflow
+
+permissions:
+  id-token: write # OIDC to AWS
+  contents: read
+  pull-requests: read
+  issues: write # creates issue for approval gate
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REPO: homelab-ecr/node
+  IMAGE_TAG: ${{ github.sha }}
+  IMAGE_VERSION: v1.0.${{ github.run_number }}
+
+jobs:
+  # 1. Static gates (run in parallel)
+  secrets:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0 
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sca:
+    name: Dependency Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # Report everything, in both machine (SARIF) and human-readable form
+      - name: Trivy fs scan (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-fs.sarif
+
+      - name: Trivy fs scan (human-readable)
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: table
+          output: trivy-fs.txt
+
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trivy-fs-report
+          path: |
+            trivy-fs.sarif
+            trivy-fs.txt
+          retention-days: 30
+
+      # Gate only on what matters
+      - name: Trivy fs scan (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+  sast:
+    name: SAST
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # semgrep-action@v1 is deprecated; using `semgrep ci` instead
+      - name: Run Semgrep (report)
+        run: semgrep ci --sarif --output=semgrep.sarif || true
+        env:
+          SEMGREP_RULES: p/javascript p/nodejs p/docker p/secrets p/owasp-top-ten
+
+      - name: Run Semgrep (human-readable)
+        if: always()
+        run: semgrep ci --text --output=semgrep.txt || true
+        env:
+          SEMGREP_RULES: p/javascript p/nodejs p/docker p/secrets p/owasp-top-ten
+
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: semgrep-report
+          path: |
+            semgrep.sarif
+            semgrep.txt
+          retention-days: 30
+
+      - name: Gate on findings
+        run: semgrep ci
+        env:
+          SEMGREP_RULES: p/javascript p/nodejs p/docker p/owasp-top-ten
+
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - run: npm ci
+      - run: npm audit --audit-level=high --omit=dev
+        continue-on-error: true
+      - run: npm test
+
+  # 2. DAST tier 1 — ephemeral container on the runner
+  #    Runs on every PR. Fast feedback, no infrastructure needed.
+  dast-baseline:
+    name: DAST (Baseline)
+    runs-on: ubuntu-latest
+    needs: [unit-test]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Build image
+        run: docker build -t app:dast .
+
+      - name: Start app
+        run: |
+          docker run -d --name app-under-test \
+            -p 3000:3000 \
+            -e NODE_ENV=test \
+            app:dast
+
+          # Wait for readiness
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/health > /dev/null; then
+              echo "App is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "App failed to start"; docker logs app-under-test; exit 1
+
+      # The ZAP action runs with --network host, so localhost resolves
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: http://localhost:3000
+          rules_file_name: .zap/rules.tsv
+          cmd_options: '-a -j'       # -a include alpha passive rules, -j ajax spider
+          allow_issue_writing: false
+          fail_action: false          # tighten to true once your rules file is tuned
+
+      - name: Dump app logs
+        if: always()
+        run: docker logs app-under-test || true
+
+  # 3. Build, scan, push
+  build-scan-push:
+    name: Build and Scan Image
+    runs-on: ubuntu-latest
+    needs: [secrets, sca, sast, unit-test, dast-baseline]
+    outputs:
+      image-uri: ${{ steps.push.outputs.image-uri }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # Runs on PR to main branch
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            --build-arg APP_VERSION=${{ env.IMAGE_VERSION }} \
+            -t app:${{ github.sha }} \
+            .
+
+      - name: Trivy image scan (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: app:${{ github.sha }}
+          format: sarif
+          output: trivy-image.sarif
+          vuln-type: os,library
+
+      - name: Trivy image scan (human-readable)
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: app:${{ github.sha }}
+          format: table
+          output: trivy-image.txt
+          vuln-type: os,library
+
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trivy-image-report
+          path: |
+            trivy-image.sarif
+            trivy-image.txt
+          retention-days: 30
+
+      - name: Trivy image scan (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: app:${{ github.sha }}
+          format: table
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: app:${{ github.sha }}
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 90
+
+      # Only runs on an actual push to main
+      - name: Configure AWS credentials
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Tag and push to ECR
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        id: push
+        run: |
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}"
+          VERSION_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_VERSION }}"
+
+          docker tag app:${{ github.sha }} "$IMAGE_URI"
+          docker tag app:${{ github.sha }} "$VERSION_URI"
+
+          docker push "$IMAGE_URI"
+          docker push "$VERSION_URI"
+
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+  # 4. Deploy to staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-scan-push]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    env:
+      ECS_CLUSTER: homelab-node-ecs
+      ECS_SERVICE: homelab-node-service-staging
+      TASK_FAMILY: homelab-node-service-staging
+      CONTAINER_NAME: node
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.TASK_FAMILY }} \
+            --query taskDefinition \
+            > task-definition.json
+
+      - name: Render new task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@138c24f321fdbdf7edee4a685519d253cae2cdea # v1.9.0
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-scan-push.outputs.image-uri }}
+
+      - name: Deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@c465972ecbd160473f22e683363b422a5412a3de # v2.6.3
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" ${{ vars.STAGING_URL }}/health)
+            [ "$code" = "200" ] && echo "Staging healthy" && exit 0
+            sleep 5
+          done
+          echo "Staging smoke test failed"; exit 1
+
+  # 5. DAST tier 2 — full active scan against staging
+  dast-staging:
+    name: DAST (Full Scan)
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    environment:
+      name: staging   # requires vars.STAGING_URL(github environment variable)
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: ZAP Full Scan
+        uses: zaproxy/action-full-scan@3c58388149901b9a03b7718852c5ba889646c27c # v0.13.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+          rules_file_name: .zap/rules.tsv
+          cmd_options: '-a -j -T 15'   # -T: max spider time in minutes
+          allow_issue_writing: false
+          fail_action: true
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zap-full-scan-report
+          path: |
+            report_html.html
+            report_json.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────
+  # 6. Manual approval gate
+  #    creates a GitHub issue for approval and blocks until reviewers write access comments
+  approve-production:
+    name: Approve Production Deploy
+    runs-on: ubuntu-latest
+    needs: [build-scan-push, dast-staging]
+    steps:
+      - name: Wait for manual approval
+        uses: trstringer/manual-approval@fa642940caf8412403569b28b2db4a1df08a83a3 # v1.13.1
+        with: 
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: happicamper   # comma-separated list, no @
+          minimum-approvals: 1
+          issue-title: "Approve production deploy — ${{ github.sha }}"
+          issue-body: |
+            Image: `${{ needs.build-scan-push.outputs.image-uri }}`
+            Commit: ${{ github.sha }}
+            Staging DAST: passed (see the dast-staging job's artifact for the report)
+
+            Comment `approve` or `approved` to deploy to production.
+            Comment `deny` or `denied` to stop the run.
+
+  # ─────────────────────────────────────────────────────────────
+  # 7. Promote to production
+  # ─────────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-scan-push, approve-production]
+    environment:
+      name: prod # requires vars.PRODUCTION_URL(github environment variable)
+      url: ${{ vars.PRODUCTION_URL }}
+    env:
+      ECS_CLUSTER: homelab-node-ecs
+      ECS_SERVICE: homelab-node-service-prod
+      TASK_FAMILY: homelab-node-service-prod
+      CONTAINER_NAME: node
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Record current task definition (for rollback)
+        id: previous
+        run: |
+          arn=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].taskDefinition' --output text)
+          echo "arn=$arn" >> $GITHUB_OUTPUT
+
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.TASK_FAMILY }} \
+            --query taskDefinition \
+            > task-definition.json
+
+      - name: Render new task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@138c24f321fdbdf7edee4a685519d253cae2cdea # v1.9.0
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-scan-push.outputs.image-uri }}
+
+      - name: Deploy
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@c465972ecbd160473f22e683363b422a5412a3de # v2.6.3
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Production smoke test
+        id: smoke
+        run: |
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" ${{ vars.PRODUCTION_URL }}/health)
+            [ "$code" = "200" ] && echo "Production healthy" && exit 0
+            sleep 5
+          done
+          exit 1
+
+      - name: Rollback on failure
+        if: failure() && steps.deploy.outcome == 'success'
+        run: |
+          echo "Rolling back to ${{ steps.previous.outputs.arn }}"
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ steps.previous.outputs.arn }} \
+            --force-new-deployment
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}

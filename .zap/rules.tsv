@@ -1,0 +1,18 @@
+# .zap/rules.tsv — one rule per line, TAB separated
+# Format:  <rule id>	<WARN|IGNORE|FAIL>	(optional comment)
+# Start permissive, then flip rules to FAIL as you fix them.
+# Find IDs in the ZAP HTML report artifact after your first run.
+
+10015	IGNORE	(Re-examine Cache-control Directives)
+10027	IGNORE	(Information Disclosure - Suspicious Comments)
+10109	IGNORE	(Modern Web Application)
+
+# Things you should actually fix, not ignore — leave these as FAIL:
+10020	FAIL	(Missing Anti-clickjacking Header)
+10021	FAIL	(X-Content-Type-Options Header Missing)
+10035	FAIL	(Strict-Transport-Security Header Not Set)
+10038	FAIL	(Content Security Policy Header Not Set)
+10011	FAIL	(Cookie Without Secure Flag)
+10054	FAIL	(Cookie Without SameSite Attribute)
+10055	FAIL	(CSP: Failure to Define Directive with No Fallback)
+10063	FAIL	(Permissions Policy Header Not Set)
