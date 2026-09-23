@@ -59,7 +59,7 @@ feature this repo doesn't rely on).
 <img width="2071" height="726" alt="deployment_overview2" src="https://github.com/user-attachments/assets/22e04d71-48ca-49b7-b0ca-c941ce937b84" />
 
 ### AWS VPC
-<img width="1702" height="969" alt="vpc" src="https://github.com/user-attachments/assets/eed899cf-4607-4564-bb97-12d8e31f50a3" />
+<img width="1702" height="969" alt="vpc" src="https://github.com/user-attachments/assets/646c8b85-9fa9-4b6e-8a55-e78008ec0ade" />
 
 ### ECS Cluster Service
 <img width="1910" height="1082" alt="ecs-cluster3" src="https://github.com/user-attachments/assets/9cd0ed54-562a-4993-a87b-dcbb00b31283" />
