@@ -8,10 +8,7 @@ on:
   workflow_dispatch: # manual trigger of workflow
 
 permissions:
-  id-token: write # OIDC to AWS
   contents: read
-  pull-requests: read
-  issues: write # creates issue for approval gate
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,6 +25,9 @@ jobs:
   secrets:
     name: Secret Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -89,7 +89,7 @@ jobs:
     name: SAST
     runs-on: ubuntu-latest
     container:
-      image: semgrep/semgrep
+      image: semgrep/semgrep:latest@sha256:acaac22ffc7b7cc5926de0751b223bce0b2491c33d18422fa72f632c78d81198
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -182,13 +182,11 @@ jobs:
         if: always()
         run: docker logs app-under-test || true
 
-  # 3. Build, scan, push
-  build-scan-push:
+  # 3. Build, scan, and publish
+  build-scan:
     name: Build and Scan Image
     runs-on: ubuntu-latest
     needs: [secrets, sca, sast, unit-test, dast-baseline]
-    outputs:
-      image-uri: ${{ steps.push.outputs.image-uri }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -252,21 +250,48 @@ jobs:
           path: sbom.cdx.json
           retention-days: 90
 
-      # Only runs on an actual push to main
-      - name: Configure AWS credentials
+      - name: Save scanned image for publishing
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: docker save app:${{ github.sha }} --output image.tar
+
+      - name: Upload scanned image
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scanned-image
+          path: image.tar
+          retention-days: 1
+
+  publish-image:
+    name: Publish Scanned Image to ECR
+    runs-on: ubuntu-latest
+    needs: [build-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image-uri: ${{ steps.push.outputs.image-uri }}
+    steps:
+      - name: Download scanned image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: scanned-image
+
+      - name: Load scanned image
+        run: docker load --input image.tar
+
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Tag and push to ECR
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         id: push
         run: |
           IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}"
@@ -284,7 +309,10 @@ jobs:
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
-    needs: [build-scan-push]
+    permissions:
+      contents: read
+      id-token: write
+    needs: [publish-image]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment:
       name: staging
@@ -316,7 +344,7 @@ jobs:
         with:
           task-definition: task-definition.json
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ needs.build-scan-push.outputs.image-uri }}
+          image: ${{ needs.publish-image.outputs.image-uri }}
 
       - name: Deploy
         uses: aws-actions/amazon-ecs-deploy-task-definition@c465972ecbd160473f22e683363b422a5412a3de # v2.6.3
@@ -370,7 +398,9 @@ jobs:
   approve-production:
     name: Approve Production Deploy
     runs-on: ubuntu-latest
-    needs: [build-scan-push, dast-staging]
+    permissions:
+      issues: write
+    needs: [publish-image, dast-staging]
     steps:
       - name: Wait for manual approval
         uses: trstringer/manual-approval@fa642940caf8412403569b28b2db4a1df08a83a3 # v1.13.1
@@ -380,7 +410,7 @@ jobs:
           minimum-approvals: 1
           issue-title: "Approve production deploy — ${{ github.sha }}"
           issue-body: |
-            Image: `${{ needs.build-scan-push.outputs.image-uri }}`
+            Image: `${{ needs.publish-image.outputs.image-uri }}`
             Commit: ${{ github.sha }}
             Staging DAST: passed (see the dast-staging job's artifact for the report)
 
@@ -393,7 +423,10 @@ jobs:
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: [build-scan-push, approve-production]
+    permissions:
+      contents: read
+      id-token: write
+    needs: [publish-image, approve-production]
     environment:
       name: prod # requires vars.PRODUCTION_URL(github environment variable)
       url: ${{ vars.PRODUCTION_URL }}
@@ -433,7 +466,7 @@ jobs:
         with:
           task-definition: task-definition.json
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ needs.build-scan-push.outputs.image-uri }}
+          image: ${{ needs.publish-image.outputs.image-uri }}
 
       - name: Deploy
         id: deploy
